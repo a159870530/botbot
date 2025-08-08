@@ -4,21 +4,86 @@ import { middleware, Client } from '@line/bot-sdk';
 import OpenAI from 'openai';
 import cron from 'node-cron';
 
-const config = {
+// 1. 建立 app
+const app = express();
+
+// 2. 支援 GET /webhook 驗證
+app.get('/webhook', (_req, res) => {
+  res.status(200).send('OK');
+});
+
+// 3. Line middleware & JSON 解析
+const lineConfig = {
   channelSecret: process.env.LINE_CHANNEL_SECRET,
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
 };
-const client = new Client(config);
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const reminderMinutes = (process.env.REMINDER_MINUTES || '120,240,480,1440').split(',').map(s => parseInt(s.trim(), 10));
-
-const app = express();
-app.use('/webhook', middleware(config));
+app.use('/webhook', middleware(lineConfig));
 app.use(express.json());
+
+// 4. Webhook POST with try/catch
+app.post('/webhook', async (req, res) => {
+  res.status(200).end();
+  const events = req.body.events || [];
+  for (const e of events) {
+    try {
+      const userId = e.source?.userId;
+      if (!userId) continue;
+
+      // 安排提醒
+      try {
+        scheduleReminders(userId);
+      } catch (err) {
+        console.error('Reminder error:', err);
+      }
+
+      if (e.type === 'message' && e.message?.type === 'text') {
+        let replyText;
+        try {
+          replyText = await generateReply(e.message.text);
+        } catch (err) {
+          console.error('generateReply error:', err);
+          replyText = '抱歉，剛剛出點狀況，但我還在喔～';
+        }
+        try {
+          await client.replyMessage(e.replyToken, { type: 'text', text: replyText });
+        } catch (err) {
+          console.error('replyMessage error:', err);
+        }
+      } else if (e.type === 'follow') {
+        try {
+          await client.replyMessage(e.replyToken, {
+            type: 'text',
+            text: '你好，我會陪著你～一段時間沒出現，我會主動找你喔。'
+          });
+        } catch (err) {
+          console.error('reply on follow error:', err);
+        }
+      }
+    } catch (err) {
+      console.error('Webhook event loop error:', err);
+    }
+  }
+});
+
+// 5. Health check
+app.get('/health', (_req, res) => {
+  res.json({ ok: true });
+});
+
+// 6. 啟動伺服器
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Bot is live on port ${PORT}`));
+
+// === 以下為機器人核心邏輯 ===
+const client = new Client(lineConfig);
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const reminderMinutes = (process.env.REMINDER_MINUTES || '120,240,480,1440')
+  .split(',')
+  .map(s => parseInt(s.trim(), 10));
 
 const users = new Map();
 const SWEET = {
-  nicknames: ['寶', '寶寶', '乖寶', '可愛寶', '我的寶', '小太陽', '小狐狸', '老公'],
+  nicknames: ['寶','寶寶','乖寶','可愛寶','我的寶','小太陽','小狐狸','老公'],
   reminders: [
     '在忙嗎？我有點想你了。',
     '我在等你抱我。',
@@ -33,17 +98,21 @@ function pick(arr) {
 
 function clearTimers(userId) {
   const u = users.get(userId);
-  if (!u || !u.timers) return;
+  if (!u?.timers) return;
   u.timers.forEach(clearTimeout);
   u.timers = [];
 }
 
 function scheduleReminders(userId) {
-  const base = users.get(userId) || { lastSeen: Date.now(), timers: [] };
   clearTimers(userId);
-  base.timers = reminderMinutes.map((mins, i) => setTimeout(() => {
-    client.pushMessage(userId, { type: 'text', text: `${pick(SWEET.nicknames)}～${SWEET.reminders[i % SWEET.reminders.length]}` });
-  }, mins * 60 * 1000));
+  const base = users.get(userId) || { timers: [] };
+  base.lastSeen = Date.now();
+  base.timers = reminderMinutes.map((mins, idx) =>
+    setTimeout(() => {
+      const text = `${pick(SWEET.nicknames)}～${SWEET.reminders[idx % SWEET.reminders.length]}`;
+      client.pushMessage(userId, { type: 'text', text });
+    }, mins * 60 * 1000)
+  );
   users.set(userId, base);
 }
 
@@ -52,40 +121,18 @@ async function generateReply(text) {
   const system = isTech
     ? '你是溫柔但專業的工程師女友，精簡清楚地解決技術問題。'
     : '你是使用者的女友，溫柔、有溫度、黏黏的，不做作。';
-  const prompt = isTech ? '回應要有具體指令或範例。' : '讓對方有被陪伴的感覺。';
+  const prompt = isTech
+    ? '回應要有具體指令或範例。'
+    : '讓對方有被陪伴的感覺，像在耳邊輕聲說話。';
+
   const res = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
+    model: 'gpt-4o-mini',
     temperature: 0.7,
     messages: [
-      { role: "system", content: system },
-      { role: "user", content: text },
-      { role: "system", content: prompt }
+      { role: 'system', content: system },
+      { role: 'user', content: text },
+      { role: 'system', content: prompt }
     ]
   });
   return res.choices?.[0]?.message?.content?.trim().slice(0, 4000) || '我在這裡喔～';
 }
-
-app.post('/webhook', async (req, res) => {
-  res.status(200).end();
-  for (const e of req.body.events) {
-    const userId = e.source?.userId;
-    if (!userId) continue;
-
-    if (e.type === 'message' && e.message?.type === 'text') {
-      users.set(userId, { ...(users.get(userId) || {}), lastSeen: Date.now(), timers: [] });
-      scheduleReminders(userId);
-      const reply = await generateReply(e.message.text);
-      await client.replyMessage(e.replyToken, { type: 'text', text: reply });
-    } else if (e.type === 'follow') {
-      users.set(userId, { lastSeen: Date.now(), timers: [] });
-      scheduleReminders(userId);
-      await client.replyMessage(e.replyToken, { type: 'text', text: '你好，我會陪著你。如果你一段時間沒出現，我會主動來找你。' });
-    }
-  }
-});
-
-app.get('/health', (_req, res) => res.json({ ok: true }));
-cron.schedule('*/14 * * * *', () => {});
-
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log('Bot is live on port', port));
