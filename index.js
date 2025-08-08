@@ -7,70 +7,62 @@ import cron from 'node-cron';
 // 1. 建立 app
 const app = express();
 
-// 2. 支援 GET /webhook 驗證
+// LINE 驗證用 GET /webhook
 app.get('/webhook', (_req, res) => {
   res.status(200).send('OK');
 });
 
-// 3. Line middleware & JSON 解析
 const lineConfig = {
   channelSecret: process.env.LINE_CHANNEL_SECRET,
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
 };
-app.use('/webhook', middleware(lineConfig));
-app.use(express.json());
+// 2. Webhook POST 路由: 先驗簽名，再解析 JSON
+app.post(
+  '/webhook',
+  middleware(lineConfig),      // LINE middleware 驗證簽名
+  express.json(),              // 解析 JSON body
+  async (req, res) => {
+    // 一進來就回 200，防止 LINE 重試
+    res.status(200).end();
 
-// 4. Webhook POST with try/catch
-app.post('/webhook', async (req, res) => {
-  res.status(200).end();
-  const events = req.body.events || [];
-  for (const e of events) {
-    try {
-      const userId = e.source?.userId;
-      if (!userId) continue;
-
-      // 安排提醒
+    const events = req.body.events || [];
+    for (const e of events) {
       try {
-        scheduleReminders(userId);
-      } catch (err) {
-        console.error('Reminder error:', err);
-      }
+        const userId = e.source?.userId;
+        if (!userId) continue;
 
-      if (e.type === 'message' && e.message?.type === 'text') {
-        let replyText;
-        try {
-          replyText = await generateReply(e.message.text);
-        } catch (err) {
-          console.error('generateReply error:', err);
-          replyText = '抱歉，剛剛出點狀況，但我還在喔～';
-        }
-        try {
+        // 安排提醒
+        scheduleReminders(userId);
+
+        if (e.type === 'message' && e.message?.type === 'text') {
+          let replyText;
+          try {
+            replyText = await generateReply(e.message.text);
+          } catch (err) {
+            console.error('generateReply error:', err);
+            replyText = '抱歉，剛剛出點狀況，但我還在喔～';
+          }
           await client.replyMessage(e.replyToken, { type: 'text', text: replyText });
-        } catch (err) {
-          console.error('replyMessage error:', err);
-        }
-      } else if (e.type === 'follow') {
-        try {
+
+        } else if (e.type === 'follow') {
           await client.replyMessage(e.replyToken, {
             type: 'text',
             text: '你好，我會陪著你～一段時間沒出現，我會主動找你喔。'
           });
-        } catch (err) {
-          console.error('reply on follow error:', err);
         }
+      } catch (err) {
+        console.error('Webhook event loop error:', err);
       }
-    } catch (err) {
-      console.error('Webhook event loop error:', err);
     }
   }
-});
+);
 
-// 5. Health check
+// 健康檢查路由
 app.get('/health', (_req, res) => {
   res.json({ ok: true });
 });
 
-// 6. 啟動伺服器
+// 啟動伺服器
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Bot is live on port ${PORT}`));
 
